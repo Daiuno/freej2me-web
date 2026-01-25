@@ -31,6 +31,8 @@ public class SkinnedMesh extends Mesh {
 
 		vtxBones = new int[vertices.getVertexCount() * Emulator3D.MaxTransformsPerVertex];
 		vtxWeights = new int[vertices.getVertexCount() * Emulator3D.MaxTransformsPerVertex];
+
+		this.resultVb = (VertexBuffer)vertices.duplicate();
 	}
 
 	public SkinnedMesh(VertexBuffer vertices, IndexBuffer[] submeshes, Appearance[] appearances, Group skeleton) {
@@ -48,6 +50,8 @@ public class SkinnedMesh extends Mesh {
 
 		vtxBones = new int[vertices.getVertexCount() * Emulator3D.MaxTransformsPerVertex];
 		vtxWeights = new int[vertices.getVertexCount() * Emulator3D.MaxTransformsPerVertex];
+
+		this.resultVb = (VertexBuffer)vertices.duplicate();
 	}
 
 	public Group getSkeleton() {
