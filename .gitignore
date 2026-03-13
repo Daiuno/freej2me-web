@@ -1,2 +1,7 @@
 /build/
 /internal/
+/freej2me/
+/node_modules/
+.DS_Store
+package-lock.json
+package.json

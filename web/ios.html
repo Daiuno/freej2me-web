@@ -1,0 +1,744 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+    <title>freej2me-web</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body {
+            width: 100%; height: 100%;
+            overflow: hidden; position: fixed;
+            touch-action: none; background: #000;
+        }
+        #screen-area {
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+        }
+        #display {
+            display: none;
+            position: absolute;
+            top: 0; left: 0;
+            background: #000;
+            image-rendering: pixelated;
+        }
+        #display:focus { outline: none; }
+        #loading {
+            color: #fff;
+            font-size: 1.2em;
+            font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+            position: absolute;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+        }
+    </style>
+    <script>
+    // Prevent double-tap zoom and scroll on iOS
+    document.addEventListener('touchmove', function(e) {
+        var target = e.target;
+        while (target && target !== document.body) {
+            if (target.scrollHeight > target.clientHeight ||
+                target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' ||
+                target.contentEditable === 'true') return;
+            target = target.parentElement;
+        }
+        e.preventDefault();
+    }, { passive: false });
+    var lastTouchEnd = 0;
+    document.addEventListener('touchend', function(e) {
+        var now = Date.now();
+        if (now - lastTouchEnd <= 300) e.preventDefault();
+        lastTouchEnd = now;
+    }, false);
+    </script>
+</head>
+<body>
+    <div id="screen-area">
+        <canvas tabindex="0" id="display"></canvas>
+        <div id="loading">Loading...</div>
+    </div>
+
+    <script>
+    // ================================================================
+    // CheerpJ caching via Cache API (works in WKWebView without SW)
+    // ================================================================
+    (function() {
+        var CACHE_NAME = 'cheerpj-cache-v2';
+        var CACHEABLE_HOSTS = ['cjrtnc.leaningtech.com'];
+
+        function isCacheable(urlStr) {
+            try {
+                var u = new URL(urlStr, location.href);
+                return CACHEABLE_HOSTS.some(function(h) { return u.hostname.indexOf(h) !== -1; });
+            } catch(e) { return false; }
+        }
+
+        var _originalFetch = window.fetch;
+        window.fetch = function(input, init) {
+            var urlStr = (typeof input === 'string') ? input : (input && input.url ? input.url : '');
+            if (!isCacheable(urlStr)) return _originalFetch.call(this, input, init);
+
+            var request = (typeof input === 'string') ? new Request(input) : input;
+            return caches.open(CACHE_NAME).then(function(cache) {
+                return cache.match(request).then(function(cached) {
+                    if (cached) return cached;
+                    return _originalFetch.call(window, input, init).then(function(response) {
+                        if (response && response.status === 200 && response.type !== 'opaque') {
+                            cache.put(request, response.clone());
+                        }
+                        return response;
+                    });
+                });
+            }).catch(function() {
+                return _originalFetch.call(window, input, init);
+            });
+        };
+    })();
+    </script>
+
+    <script src="https://cjrtnc.leaningtech.com/4.2/loader.js"></script>
+    <script type="module">
+        import { LibMedia } from "./libmedia/libmedia.js";
+        import { LibMidi, createUnlockingAudioContext } from "./libmidi/libmidi.js";
+        import { codeMap, KeyRepeatManager } from "./src/key.js";
+        import { EventQueue } from "./src/eventqueue.js";
+
+        import canvasFontNatives from "./libjs/libcanvasfont.js";
+        import canvasGraphicsNatives from "./libjs/libcanvasgraphics.js";
+        import gles2Natives from "./libjs/libgles2.js";
+        import jsReferenceNatives from "./libjs/libjsreference.js";
+        import mediaBridgeNatives from "./libjs/libmediabridge.js";
+        import midiBridgeNatives from "./libjs/libmidibridge.js";
+
+        // ================================================================
+        // State
+        // ================================================================
+        const evtQueue = new EventQueue();
+        const appPath = window.location.pathname;
+        const appDir = appPath.substring(0, appPath.lastIndexOf('/'));
+        const cheerpjWebRoot = '/app' + appDir;
+
+        let display = null;
+        let screenCtx = null;           // The 2D context Java paints into
+        let _origDrawImage = null;       // Original screenCtx.drawImage for pause
+        let libmidi = null;
+        let libmedia = null;
+        let keyRepeatManager = null;
+        let freej2meLib = null;
+
+        // Pause / mute state
+        let isPaused = false;
+        let isMuted = false;
+        // Track all MediaPlayer instances so we can mute their <video> elements
+        let _mediaPlayers = [];
+
+        // Save watch
+        let _currentAppId = null;
+        let _saveWatchTimer = null;
+        let _lastSaveSize = -1;  // byte length of last exportData() result
+
+        // Scale mode
+        let _scaleMode = 'stretch';
+        let _canvasNativeW = 0;
+        let _canvasNativeH = 0;
+
+        const keyCodeMap = {
+            'Enter': 13, 'Backspace': 8, 'Delete': 46,
+            'ArrowLeft': 37, 'ArrowRight': 39, 'ArrowUp': 38, 'ArrowDown': 40,
+            'Escape': 27,
+            'Digit0': 48, 'Digit1': 49, 'Digit2': 50, 'Digit3': 51, 'Digit4': 52,
+            'Digit5': 53, 'Digit6': 54, 'Digit7': 55, 'Digit8': 56, 'Digit9': 57,
+            'Numpad0': 96, 'Numpad1': 97, 'Numpad2': 98, 'Numpad3': 99, 'Numpad4': 100,
+            'Numpad5': 101, 'Numpad6': 102, 'Numpad7': 103, 'Numpad8': 104, 'Numpad9': 105,
+            'NumpadDivide': 111, 'NumpadMultiply': 106,
+            'F1': 112, 'F2': 113, 'F3': 114,
+            'Space': 32,
+            'KeyA': 65, 'KeyB': 66, 'KeyC': 67, 'KeyD': 68, 'KeyE': 69, 'KeyF': 70,
+            'KeyG': 71, 'KeyH': 72, 'KeyI': 73, 'KeyJ': 74, 'KeyK': 75, 'KeyL': 76,
+            'KeyM': 77, 'KeyN': 78, 'KeyO': 79, 'KeyP': 80, 'KeyQ': 81, 'KeyR': 82,
+            'KeyS': 83, 'KeyT': 84, 'KeyU': 85, 'KeyV': 86, 'KeyW': 87, 'KeyX': 88,
+            'KeyY': 89, 'KeyZ': 90
+        };
+
+        // ================================================================
+        // Canvas scaling
+        // ================================================================
+        function applyCanvasScale() {
+            if (!display || _canvasNativeW <= 0 || _canvasNativeH <= 0) return;
+
+            const vw = window.innerWidth;
+            const vh = window.innerHeight;
+            let w, h, top, left, tf;
+
+            if (_scaleMode === 'fit') {
+                const scale = Math.min(vw / _canvasNativeW, vh / _canvasNativeH);
+                w = Math.floor(_canvasNativeW * scale) + 'px';
+                h = Math.floor(_canvasNativeH * scale) + 'px';
+                top = '50%'; left = '50%'; tf = 'translate(-50%,-50%)';
+            } else {
+                w = vw + 'px'; h = vh + 'px';
+                top = '0px'; left = '0px'; tf = '';
+            }
+
+            display.style.width = w;
+            display.style.height = h;
+            display.style.top = top;
+            display.style.left = left;
+            display.style.transform = tf || 'none';
+        }
+
+        window.addEventListener('resize', applyCanvasScale);
+
+        // ================================================================
+        // Touch coordinate mapping
+        // ================================================================
+        function touchToCanvasCoords(touchX, touchY) {
+            const rect = display.getBoundingClientRect();
+            const scaleX = _canvasNativeW / rect.width;
+            const scaleY = _canvasNativeH / rect.height;
+            return {
+                x: Math.floor((touchX - rect.left) * scaleX),
+                y: Math.floor((touchY - rect.top) * scaleY)
+            };
+        }
+
+        // ================================================================
+        // Event listeners
+        // ================================================================
+        function setListeners() {
+            keyRepeatManager = new KeyRepeatManager();
+
+            keyRepeatManager.register((kind, key, args) => {
+                if (codeMap[key]) {
+                    const symbol = key.startsWith('Digit') ? key.substring(5).charCodeAt(0) : '\x00';
+                    if (kind === 'down' || kind === 'repeat') {
+                        evtQueue.queueEvent({
+                            kind: 'keydown',
+                            args: [codeMap[key], args.symbol || symbol, false, false]
+                        });
+                    } else if (kind === 'up') {
+                        evtQueue.queueEvent({
+                            kind: 'keyup',
+                            args: [codeMap[key], args.symbol || symbol, false, false]
+                        });
+                    }
+                }
+            });
+
+            // Touch events
+            display.addEventListener('touchstart', e => {
+                e.preventDefault();
+                const touch = e.changedTouches[0];
+                const coords = touchToCanvasCoords(touch.clientX, touch.clientY);
+                evtQueue.queueEvent({ kind: 'pointerpressed', x: coords.x, y: coords.y });
+            }, { passive: false });
+
+            display.addEventListener('touchmove', e => {
+                e.preventDefault();
+                const touch = e.changedTouches[0];
+                const coords = touchToCanvasCoords(touch.clientX, touch.clientY);
+                evtQueue.queueEvent({ kind: 'pointerdragged', x: coords.x, y: coords.y });
+            }, { passive: false });
+
+            display.addEventListener('touchend', e => {
+                e.preventDefault();
+                const touch = e.changedTouches[0];
+                const coords = touchToCanvasCoords(touch.clientX, touch.clientY);
+                evtQueue.queueEvent({ kind: 'pointerreleased', x: coords.x, y: coords.y });
+            }, { passive: false });
+
+            // Mouse events (for browser testing)
+            display.addEventListener('mousedown', e => {
+                const coords = touchToCanvasCoords(e.clientX, e.clientY);
+                evtQueue.queueEvent({ kind: 'pointerpressed', x: coords.x, y: coords.y });
+            });
+
+            display.addEventListener('mousemove', e => {
+                if (e.buttons) {
+                    const coords = touchToCanvasCoords(e.clientX, e.clientY);
+                    evtQueue.queueEvent({ kind: 'pointerdragged', x: coords.x, y: coords.y });
+                }
+            });
+
+            display.addEventListener('mouseup', e => {
+                const coords = touchToCanvasCoords(e.clientX, e.clientY);
+                evtQueue.queueEvent({ kind: 'pointerreleased', x: coords.x, y: coords.y });
+            });
+
+            // Keyboard events
+            document.addEventListener('keydown', e => {
+                if (e.repeat) return;
+                keyRepeatManager.post(true, e.code, { symbol: keyCodeMap[e.code] || 0 });
+            });
+
+            document.addEventListener('keyup', e => {
+                keyRepeatManager.post(false, e.code, { symbol: keyCodeMap[e.code] || 0 });
+            });
+
+            display.focus();
+            display.addEventListener('blur', () => {
+                setTimeout(() => display.focus(), 10);
+            });
+        }
+
+        // ================================================================
+        // Audio helpers
+        // ================================================================
+
+        // Apply mute/unmute to all known audio sources.
+        // Uses gainNode (value=0) rather than AudioContext.suspend() to avoid
+        // WKWebView quirks where a suspended context cannot be resumed reliably.
+        function _applyAudioMute(muted) {
+            // 1. MIDI: set gainNode gain to 0
+            try {
+                if (libmidi && libmidi._midiPlayer && libmidi._midiPlayer.gainNode) {
+                    libmidi._midiPlayer.gainNode.gain.value = muted ? 0 : 1;
+                }
+            } catch(e) {}
+
+            // 2. Media players (<video>/<audio> elements): set volume to 0
+            _mediaPlayers = _mediaPlayers.filter(p => p && p.mediaElement);
+            _mediaPlayers.forEach(function(p) {
+                try { p.mediaElement.muted = muted; } catch(e) {}
+            });
+        }
+
+        // ================================================================
+        // CheerpJ initialization
+        // ================================================================
+        async function initCheerpJ() {
+            // Wrap createMediaPlayer to track all MediaPlayer instances for mute control
+            const wrappedMediaBridgeNatives = Object.assign({}, mediaBridgeNatives, {
+                async Java_pl_zb3_freej2me_bridge_media_MediaBridge_createMediaPlayer(lib) {
+                    const player = window.libmedia.createMediaPlayer();
+                    player.addEventListener('end-of-media', e => {
+                        window.evtQueue.queueEvent({kind: 'player-eom', player: e.target});
+                    });
+                    // Track player for mute/pause control
+                    _mediaPlayers.push(player);
+                    if (isMuted) { try { player.mediaElement.muted = true; } catch(e) {} }
+                    return player;
+                }
+            });
+
+            return cheerpjInit({
+                enableDebug: false,
+                natives: {
+                    ...canvasFontNatives,
+                    ...canvasGraphicsNatives,
+                    ...gles2Natives,
+                    ...jsReferenceNatives,
+                    ...wrappedMediaBridgeNatives,
+                    ...midiBridgeNatives,
+                    async Java_pl_zb3_freej2me_bridge_shell_Shell_setTitle(lib, title) {
+                        document.title = title;
+                    },
+                    async Java_pl_zb3_freej2me_bridge_shell_Shell_setIcon(lib, iconBytes) {
+                    },
+                    async Java_pl_zb3_freej2me_bridge_shell_Shell_getScreenCtx(lib) {
+                        return screenCtx;
+                    },
+                    async Java_pl_zb3_freej2me_bridge_shell_Shell_setCanvasSize(lib, width, height) {
+                        screenCtx.canvas.width = width;
+                        screenCtx.canvas.height = height;
+                        _canvasNativeW = width;
+                        _canvasNativeH = height;
+                        document.getElementById('loading').hidden = true;
+                        display.style.display = 'block';
+                        applyCanvasScale();
+                        display.focus();
+                    },
+                    async Java_pl_zb3_freej2me_bridge_shell_Shell_waitForAndDispatchEvents(lib, listener) {
+                        // When paused: block input events but let the game's internal threads run.
+                        // The canvas drawImage is patched to no-op when paused, so screen freezes.
+                        if (isPaused) {
+                            await new Promise(r => setTimeout(r, 100));
+                            return;
+                        }
+                        const KeyEvent = await lib.pl.zb3.freej2me.bridge.shell.KeyEvent;
+                        const PointerEvent = await lib.pl.zb3.freej2me.bridge.shell.PointerEvent;
+
+                        const evt = await evtQueue.waitForEvent();
+                        if (evt.kind === 'keydown') {
+                            await listener.keyPressed(await new KeyEvent(...evt.args));
+                        } else if (evt.kind === 'keyup') {
+                            await listener.keyReleased(await new KeyEvent(...evt.args));
+                        } else if (evt.kind === 'pointerpressed') {
+                            await listener.pointerPressed(await new PointerEvent(evt.x, evt.y));
+                        } else if (evt.kind === 'pointerdragged') {
+                            await listener.pointerDragged(await new PointerEvent(evt.x, evt.y));
+                        } else if (evt.kind === 'pointerreleased') {
+                            await listener.pointerReleased(await new PointerEvent(evt.x, evt.y));
+                        } else if (evt.kind === 'player-eom') {
+                            await listener.playerEOM(evt.player);
+                        } else if (evt.kind === 'player-video-frame') {
+                            await listener.playerVideoFrame(evt.player);
+                        }
+                    },
+                    async Java_pl_zb3_freej2me_bridge_shell_Shell_restart(lib) {
+                        location.reload();
+                    },
+                    async Java_pl_zb3_freej2me_bridge_shell_Shell_exit(lib) {
+                        try {
+                            window.webkit.messageHandlers.j2me.postMessage({ type: 'exit' });
+                        } catch(e) {}
+                    },
+                    async Java_pl_zb3_freej2me_bridge_shell_Shell_say(lib, sth) {
+                        console.log('[say]', sth);
+                    }
+                }
+            });
+        }
+
+        // ================================================================
+        // Initialization
+        // ================================================================
+        async function init() {
+            display = document.getElementById('display');
+            screenCtx = display.getContext('2d');
+            // Save the real drawImage so we can restore it on resume
+            _origDrawImage = screenCtx.drawImage.bind(screenCtx);
+
+            setListeners();
+
+            document.getElementById('loading').textContent = 'Initializing audio...';
+
+            libmidi = new LibMidi(createUnlockingAudioContext());
+            await libmidi.init();
+            window.libmidi = libmidi;
+            // Expose evtQueue for mediaBridgeNatives override above
+            window.evtQueue = evtQueue;
+
+            libmedia = new LibMedia();
+            window.libmedia = libmedia;
+
+            document.getElementById('loading').textContent = 'Loading CheerpJ...';
+            console.log('Start loading CheerpJ');
+            await initCheerpJ();
+            console.log('CheerpJ loaded');
+            document.getElementById('loading').textContent = 'Loading freej2me...';
+
+            console.log('Start loading freej2me');
+            freej2meLib = await cheerpjRunLibrary(cheerpjWebRoot + '/freej2me-web.jar');
+            console.log('freej2me loaded');
+            window.freej2meReady = true;
+
+            notifyReady();
+            console.log('Notify Swift');
+
+            var tp = new URLSearchParams(window.location.search);
+            if (tp.get('test') === '1') {
+                const testJarPath = cheerpjWebRoot + '/../Anyview4.0.jar';
+                const FreeJ2ME = await freej2meLib.org.recompile.freej2me.FreeJ2ME;
+                FreeJ2ME.main(['jar', testJarPath]).catch(e => {
+                    console.error('Test JAR error:', e);
+                });
+            }
+        }
+
+        // ================================================================
+        // Notify Swift
+        // ================================================================
+        function notifyReady() {
+            try {
+                if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.j2me) {
+                    window.webkit.messageHandlers.j2me.postMessage({ type: 'ready' });
+                }
+            } catch(e) {}
+        }
+
+        // ================================================================
+        // Public API
+        // ================================================================
+        // openJar(jarData, jarName, saveB64?, locale?)
+        // saveB64: base64 encoded ZIP of save data to restore before game starts.
+        //          Must be passed here (not called separately before openJar) because
+        //          CheerpJ rejects importData() while a previous FreeJ2ME.main() is running.
+        // locale:  BCP-47 locale string (e.g. 'zh-CN', 'en-US'). Sets microedition.locale
+        //          in systemproperties.conf before the game starts. If omitted, uses
+        //          navigator.language (device language), falling back to 'en-US'.
+        async function openJar(jarData, jarName, saveB64, locale) {
+            console.log('Start openJar');
+            if (!freej2meLib) {
+                await init();
+            }
+            console.log('freej2meLib init done');
+            const array = (jarData instanceof Uint8Array) ? jarData : new Uint8Array(jarData);
+            cheerpOSAddStringFile('/str/game.jar', array);
+            // appId: 'game.jar' → 'game_jar' (dots replaced with underscores, matching LauncherUtil)
+            _currentAppId = 'game_jar';
+            _mediaPlayers = [];  // reset tracked players for new game
+
+            // Restore save data BEFORE starting the game, while no Java code is running.
+            if (saveB64) {
+                try {
+                    const binary = atob(saveB64);
+                    const arr = new Int8Array(binary.length);
+                    for (let i = 0; i < binary.length; i++) { arr[i] = binary.charCodeAt(i); }
+                    const LauncherUtil = await freej2meLib.pl.zb3.freej2me.launcher.LauncherUtil;
+                    await LauncherUtil.importData(arr);
+                    console.log('[freej2me] Save data restored before game start');
+                } catch(e) {
+                    console.error('[freej2me] Failed to restore save data:', e);
+                }
+            }
+
+            // Write locale into systemproperties.conf so the game sees the correct
+            // microedition.locale when it calls System.getProperty("microedition.locale").
+            // FreeJ2ME reads this file in Config.init() before runJar() is called.
+            // Priority: explicit locale arg → navigator.language → 'en-US'
+            const effectiveLocale = locale || navigator.language || 'en-US';
+            try {
+                const HashMap = await freej2meLib.java.util.HashMap;
+                const sysProps = await new HashMap();
+                await sysProps.put('microedition.locale', effectiveLocale);
+                const LauncherUtil = await freej2meLib.pl.zb3.freej2me.launcher.LauncherUtil;
+                await LauncherUtil.saveApp(_currentAppId, null, null, sysProps);
+                console.log('[freej2me] Set microedition.locale =', effectiveLocale);
+            } catch(e) {
+                console.error('[freej2me] Failed to set locale:', e);
+            }
+
+            console.log('Start loading Jar, appId:', _currentAppId);
+            const FreeJ2ME = await freej2meLib.org.recompile.freej2me.FreeJ2ME;
+            console.log('FreeJ2ME loaded');
+            FreeJ2ME.main(['jar', '/str/game.jar']).catch(e => {
+                console.error('FreeJ2ME error:', e);
+                document.getElementById('loading').textContent = 'Error loading game';
+            });
+            // Begin polling for save data changes
+            _startSaveWatch();
+        }
+
+        function pressKey(key) {
+            if (keyRepeatManager) {
+                keyRepeatManager.post(true, key, { symbol: keyCodeMap[key] || 0 });
+            }
+        }
+
+        function releaseKey(key) {
+            if (keyRepeatManager) {
+                keyRepeatManager.post(false, key, { symbol: keyCodeMap[key] || 0 });
+            }
+        }
+
+        // ================================================================
+        // Pause / Resume
+        // Pausing:
+        //   - Blocks input dispatch (isPaused flag in waitForAndDispatchEvents)
+        //   - Patches screenCtx.drawImage to no-op so the canvas freezes
+        //   - Silences all audio via gain=0 / muted=true
+        // Resuming reverses all of the above.
+        // ================================================================
+        function pause() {
+            if (isPaused) return;
+            isPaused = true;
+
+            // Freeze canvas: replace drawImage with a no-op so the Java painter
+            // thread's calls have no visual effect while paused
+            if (screenCtx && _origDrawImage) {
+                screenCtx.drawImage = function() {};
+            }
+
+            _applyAudioMute(true);
+            console.log('[iOS] freej2me paused');
+        }
+
+        function resume() {
+            if (!isPaused) return;
+            isPaused = false;
+
+            // Restore canvas drawing
+            if (screenCtx && _origDrawImage) {
+                screenCtx.drawImage = _origDrawImage;
+            }
+
+            // Restore audio only if not globally muted
+            if (!isMuted) {
+                _applyAudioMute(false);
+            }
+            console.log('[iOS] freej2me resumed');
+        }
+
+        // ================================================================
+        // Mute / Unmute
+        // Independent of pause: sets gain=0 on MIDI gainNode and mutes
+        // all <video>/<audio> mediaElement instances.
+        // ================================================================
+        function setMute(muted) {
+            isMuted = muted;
+            // Only touch audio if not paused (pause already silences audio)
+            if (!isPaused) {
+                _applyAudioMute(muted);
+            }
+        }
+
+        // ================================================================
+        // Speed — CheerpJ does not support Java execution speed adjustment.
+        // We simply log the request. Audio playback rate is not applicable
+        // to AudioWorklet-based MIDI synthesis.
+        // ================================================================
+        function setSpeed(multiplier) {
+            console.log('[iOS] setSpeed', multiplier, '(not supported by CheerpJ)');
+        }
+
+        // ================================================================
+        // Save data
+        // getSaveData: calls LauncherUtil.exportData() → ZIP → base64 string
+        // loadSaveData: base64 string → ZIP → LauncherUtil.importData()
+        //   NOTE: loadSaveData must be called BEFORE the game JAR is launched
+        //   so the restored RMS data is available when the game starts.
+        // ================================================================
+        async function getSaveData() {
+            if (!freej2meLib) return null;
+            try {
+                const LauncherUtil = await freej2meLib.pl.zb3.freej2me.launcher.LauncherUtil;
+                const zipBytes = await LauncherUtil.exportData();
+                if (!zipBytes) return null;
+                // CheerpJ returns a Java byte[] as an Int8Array; convert to Uint8Array for btoa
+                const u8 = new Uint8Array(zipBytes.buffer || zipBytes);
+                if (u8.length === 0) return null;
+                // Use chunked btoa to avoid stack overflow on large arrays
+                let binary = '';
+                const CHUNK = 8192;
+                for (let i = 0; i < u8.length; i += CHUNK) {
+                    binary += String.fromCharCode.apply(null, u8.subarray(i, i + CHUNK));
+                }
+                return btoa(binary);
+            } catch(e) {
+                console.error('[freej2me] getSaveData error:', e);
+                return null;
+            }
+        }
+
+        async function loadSaveData(b64Data) {
+            if (!freej2meLib || !b64Data) return false;
+            try {
+                const binary = atob(b64Data);
+                // Pass as Int8Array — LauncherUtil.importData() expects byte[]
+                const arr = new Int8Array(binary.length);
+                for (let i = 0; i < binary.length; i++) { arr[i] = binary.charCodeAt(i); }
+
+                const LauncherUtil = await freej2meLib.pl.zb3.freej2me.launcher.LauncherUtil;
+                const result = await LauncherUtil.importData(arr);
+                console.log('[freej2me] loadSaveData result:', result);
+                return !!result;
+            } catch(e) {
+                console.error('[freej2me] loadSaveData error:', e);
+                return false;
+            }
+        }
+
+        // ================================================================
+        // Save data change detection
+        // Polls LauncherUtil.exportData() every 3 seconds.
+        // If the ZIP byte length changes, assume save data was written and
+        // notify Swift via 'saveDataWritten' message with base64 ZIP payload.
+        //
+        // This works because RecordStore.save() writes files synchronously to
+        // CheerpJ's /files/ filesystem (IDB-backed), and exportData() zips
+        // the current /files/ directory contents.
+        // ================================================================
+        function _startSaveWatch() {
+            if (_saveWatchTimer) {
+                clearInterval(_saveWatchTimer);
+                _saveWatchTimer = null;
+            }
+            _lastSaveSize = -1;
+
+            _saveWatchTimer = setInterval(async function() {
+                if (!freej2meLib || !_currentAppId) return;
+                try {
+                    const LauncherUtil = await freej2meLib.pl.zb3.freej2me.launcher.LauncherUtil;
+                    const zipBytes = await LauncherUtil.exportData();
+                    if (!zipBytes) return;
+
+                    const size = (zipBytes.buffer || zipBytes).byteLength || zipBytes.length || 0;
+                    if (size === 0) return;
+
+                    if (_lastSaveSize !== -1 && size !== _lastSaveSize) {
+                        // Size changed — export and notify Swift
+                        _doSaveNotify(zipBytes);
+                    }
+                    _lastSaveSize = size;
+                } catch(e) {
+                    // Ignore errors (game may not have started yet)
+                }
+            }, 3000);
+        }
+
+        async function _doSaveNotify(zipBytes) {
+            try {
+                const u8 = new Uint8Array(zipBytes.buffer || zipBytes);
+                let binary = '';
+                const CHUNK = 8192;
+                for (let i = 0; i < u8.length; i += CHUNK) {
+                    binary += String.fromCharCode.apply(null, u8.subarray(i, i + CHUNK));
+                }
+                const b64 = btoa(binary);
+                window.webkit.messageHandlers.j2me.postMessage({ type: 'saveDataWritten', data: b64 });
+            } catch(e) {
+                console.error('[freej2me] saveDataWritten notify error:', e);
+            }
+        }
+
+        // ================================================================
+        // Scale / Screen
+        // ================================================================
+        function setScaleMode(mode) {
+            _scaleMode = (mode === 'fit') ? 'fit' : 'stretch';
+            applyCanvasScale();
+        }
+
+        function getScaleMode() {
+            return _scaleMode;
+        }
+
+        function setScreenSize(w, h) {
+            if (display) {
+                display.width = w;
+                display.height = h;
+                _canvasNativeW = w;
+                _canvasNativeH = h;
+                applyCanvasScale();
+            }
+        }
+
+        // ================================================================
+        // Expose APIs
+        // ================================================================
+        window.freej2meReady = false;
+
+        window.freej2meAPI = {
+            openJar,
+            pressKey,
+            releaseKey,
+            pause,
+            resume,
+            setMute,
+            setScaleMode,
+            getScaleMode,
+            setScreenSize,
+            setSpeed,
+            getSaveData,
+            loadSaveData
+        };
+
+        // Input API matching J2meJS pattern for Swift pressButton calls
+        window.Input = {
+            keyDown: function(k) { pressKey(k); },
+            keyUp: function(k) { releaseKey(k); }
+        };
+
+        // Parse URL params
+        var tp = new URLSearchParams(window.location.search);
+        if (tp.get('scale') === 'fit') { _scaleMode = 'fit'; }
+
+        // Auto-initialize
+        init().catch(e => {
+            console.error('Initialization error:', e);
+            document.getElementById('loading').textContent = 'Initialization failed: ' + e.message;
+        });
+    </script>
+</body>
+</html>
