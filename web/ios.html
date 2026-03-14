@@ -55,7 +55,7 @@
 <body>
     <div id="screen-area">
         <canvas tabindex="0" id="display"></canvas>
-        <div id="loading">Loading...</div>
+        <div id="loading"></div>
     </div>
 
     <script>
@@ -136,6 +136,11 @@
         let _currentAppId = null;
         let _saveWatchTimer = null;
         let _lastSaveSize = -1;  // byte length of last exportData() result
+
+        // Locale to inject into System.setProperty once the game is running.
+        // Set by openJar() and applied on first waitForAndDispatchEvents call.
+        let _pendingLocale = null;
+        let _localeInjected = false;
 
         // Scale mode
         let _scaleMode = 'stretch';
@@ -349,8 +354,19 @@
                         display.focus();
                     },
                     async Java_pl_zb3_freej2me_bridge_shell_Shell_waitForAndDispatchEvents(lib, listener) {
-                        // When paused: block input events but let the game's internal threads run.
-                        // The canvas drawImage is patched to no-op when paused, so screen freezes.
+                        // Inject locale on first call — at this point runJar() has started
+                        // (MIDlet.startApp() is about to run) and setSystemPropertyOverrides()
+                        // has already executed, so this call wins and the game reads the correct locale.
+                        if (!_localeInjected && _pendingLocale) {
+                            _localeInjected = true;
+                            try {
+                                const System = await lib.java.lang.System;
+                                await System.setProperty('microedition.locale', _pendingLocale);
+                                console.log('[freej2me] Injected microedition.locale =', _pendingLocale);
+                            } catch(e) {
+                                console.error('[freej2me] Failed to inject locale:', e);
+                            }
+                        }
                         if (isPaused) {
                             await new Promise(r => setTimeout(r, 100));
                             return;
@@ -401,7 +417,7 @@
 
             setListeners();
 
-            document.getElementById('loading').textContent = 'Initializing audio...';
+            document.getElementById('loading').textContent = '';
 
             libmidi = new LibMidi(createUnlockingAudioContext());
             await libmidi.init();
@@ -412,11 +428,11 @@
             libmedia = new LibMedia();
             window.libmedia = libmedia;
 
-            document.getElementById('loading').textContent = 'Loading CheerpJ...';
+            document.getElementById('loading').textContent = '';
             console.log('Start loading CheerpJ');
             await initCheerpJ();
             console.log('CheerpJ loaded');
-            document.getElementById('loading').textContent = 'Loading freej2me...';
+            document.getElementById('loading').textContent = '';
 
             console.log('Start loading freej2me');
             freej2meLib = await cheerpjRunLibrary(cheerpjWebRoot + '/freej2me-web.jar');
@@ -450,15 +466,21 @@
         // ================================================================
         // Public API
         // ================================================================
-        // openJar(jarData, jarName, saveB64?, locale?)
-        // saveB64: base64 encoded ZIP of save data to restore before game starts.
-        //          Must be passed here (not called separately before openJar) because
-        //          CheerpJ rejects importData() while a previous FreeJ2ME.main() is running.
-        // locale:  BCP-47 locale string (e.g. 'zh-CN', 'en-US'). Sets microedition.locale
-        //          in systemproperties.conf before the game starts. If omitted, uses
-        //          navigator.language (device language), falling back to 'en-US'.
-        async function openJar(jarData, jarName, saveB64, locale) {
-            console.log('Start openJar');
+        // openJar(jarData, jarName, saveB64?, locale?, screenSize?, rotation?)
+        // saveB64:     base64 encoded ZIP of save data to restore before game starts.
+        //              Must be passed here (not called separately before openJar) because
+        //              CheerpJ rejects importData() while a previous FreeJ2ME.main() is running.
+        // locale:      BCP-47 locale string (e.g. 'zh-CN', 'en-US'). Sets microedition.locale
+        //              in systemproperties.conf before the game starts. If omitted, uses
+        //              navigator.language (device language), falling back to 'en-US'.
+        // screenSize:  "WxH" string (e.g. "240x320"). Passed to Java via LauncherUtil.saveApp()
+        //              so Config.init() reads correct canvas dimensions on startup.
+        //              If omitted, freej2me uses its own default (240x320).
+        // rotation:    boolean. If true, writes rotate=on to settings.conf. freej2me Java layer
+        //              handles rotation internally: TRANS_ROT270 painter + swapped setCanvasSize.
+        //              No CSS rotation needed on the JS side.
+        async function openJar(jarData, jarName, saveB64, locale, screenSize, rotation) {
+            console.log('Start openJar!');
             if (!freej2meLib) {
                 await init();
             }
@@ -483,28 +505,63 @@
                 }
             }
 
-            // Write locale into systemproperties.conf so the game sees the correct
-            // microedition.locale when it calls System.getProperty("microedition.locale").
-            // FreeJ2ME reads this file in Config.init() before runJar() is called.
-            // Priority: explicit locale arg → navigator.language → 'en-US'
-            const effectiveLocale = locale || navigator.language || 'en-US';
-            try {
-                const HashMap = await freej2meLib.java.util.HashMap;
-                const sysProps = await new HashMap();
-                await sysProps.put('microedition.locale', effectiveLocale);
-                const LauncherUtil = await freej2meLib.pl.zb3.freej2me.launcher.LauncherUtil;
-                await LauncherUtil.saveApp(_currentAppId, null, null, sysProps);
-                console.log('[freej2me] Set microedition.locale =', effectiveLocale);
-            } catch(e) {
-                console.error('[freej2me] Failed to set locale:', e);
+            // Write screenSize and rotation to settings.conf BEFORE FreeJ2ME.main() starts.
+            //
+            // How the desktop flow works (index.html → run.html):
+            //   index.html calls LauncherUtil.saveApp() synchronously, persisting settings to IDB.
+            //   run.html is a SEPARATE page load — FreeJ2ME reads the persisted settings fresh.
+            //
+            // Our iOS flow (single page):
+            //   We call LauncherUtil.saveApp() here. FreeJ2ME.main() then calls initApp(null,null,null)
+            //   which internally calls saveApp(null,null,null) — reads the file we just wrote and
+            //   writes it back unchanged. Then config.init() reads it again for the final values.
+            //   This preserves our settings as long as the IDB write is flushed before initApp reads.
+            //
+            // To ensure correctness, we also pass the settings to initApp via a pending map that
+            // the Java FreeJ2ME constructor will pick up. Since we cannot hook into FreeJ2ME's
+            // constructor directly, we rely on pre-writing and the file surviving initApp's read-back.
+            if (screenSize || rotation !== undefined) {
+                try {
+                    const LauncherUtil = await freej2meLib.pl.zb3.freej2me.launcher.LauncherUtil;
+                    const HashMap = await freej2meLib.java.util.HashMap;
+                    const settingsMap = await new HashMap();
+
+                    if (screenSize) {
+                        const parts = String(screenSize).trim().split(/[x,]/);
+                        if (parts.length === 2) {
+                            const sw = parseInt(parts[0], 10), sh = parseInt(parts[1], 10);
+                            if (sw > 0 && sh > 0) {
+                                await settingsMap.put('width', String(sw));
+                                await settingsMap.put('height', String(sh));
+                                console.log('[freej2me] screenSize →', sw, 'x', sh);
+                            }
+                        }
+                    }
+                    await settingsMap.put('rotate', rotation ? 'on' : 'off');
+
+                    // saveApp writes to /files/game_jar/config/settings.conf via Java File API.
+                    // FreeJ2ME.main (jar mode) calls initApp(null,null,null) which reads this file
+                    // and writes it back — our values are preserved through that round-trip.
+                    await LauncherUtil.saveApp('game_jar', settingsMap, null, null);
+                    console.log('[freej2me] Settings pre-written: screenSize=', screenSize, 'rotation=', rotation);
+                } catch(e) {
+                    console.error('[freej2me] Failed to pre-write settings:', e);
+                }
             }
+
+            // Set locale to inject on first waitForAndDispatchEvents call (after runJar starts,
+            // before MIDlet.startApp() reads microedition.locale).
+            // Priority: explicit locale arg → navigator.language → 'en-US'
+            _pendingLocale = locale || navigator.language || 'en-US';
+            _localeInjected = false;
+            console.log('[freej2me] Pending locale =', _pendingLocale);
 
             console.log('Start loading Jar, appId:', _currentAppId);
             const FreeJ2ME = await freej2meLib.org.recompile.freej2me.FreeJ2ME;
             console.log('FreeJ2ME loaded');
             FreeJ2ME.main(['jar', '/str/game.jar']).catch(e => {
                 console.error('FreeJ2ME error:', e);
-                document.getElementById('loading').textContent = 'Error loading game';
+                document.getElementById('loading').textContent = '';
             });
             // Begin polling for save data changes
             _startSaveWatch();
@@ -694,16 +751,6 @@
             return _scaleMode;
         }
 
-        function setScreenSize(w, h) {
-            if (display) {
-                display.width = w;
-                display.height = h;
-                _canvasNativeW = w;
-                _canvasNativeH = h;
-                applyCanvasScale();
-            }
-        }
-
         // ================================================================
         // Expose APIs
         // ================================================================
@@ -718,7 +765,6 @@
             setMute,
             setScaleMode,
             getScaleMode,
-            setScreenSize,
             setSpeed,
             getSaveData,
             loadSaveData
@@ -737,7 +783,7 @@
         // Auto-initialize
         init().catch(e => {
             console.error('Initialization error:', e);
-            document.getElementById('loading').textContent = 'Initialization failed: ' + e.message;
+            document.getElementById('loading').textContent = '';
         });
     </script>
 </body>
