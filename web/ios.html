@@ -147,6 +147,12 @@
         let _canvasNativeW = 0;
         let _canvasNativeH = 0;
 
+        // Rotation: set by openJar(). When true, Java's FreeJ2ME uses TRANS_ROT270
+        // to paint and swaps setCanvasSize(w,h). Java's pointer handler does a simple
+        // swap (x=e.y, y=e.x) but omits the Y-axis flip needed for ROT270, so we
+        // compensate on the JS side by flipping the Y coordinate before sending it.
+        let _isRotated = false;
+
         const keyCodeMap = {
             'Enter': 13, 'Backspace': 8, 'Delete': 46,
             'ArrowLeft': 37, 'ArrowRight': 39, 'ArrowUp': 38, 'ArrowDown': 40,
@@ -192,19 +198,49 @@
             display.style.transform = tf || 'none';
         }
 
-        window.addEventListener('resize', applyCanvasScale);
+        // WKWebView may animate window size changes; the resize event fires at
+        // the START of the animation with an intermediate size. Schedule a
+        // delayed re-application to catch the final size after the animation.
+        let _applying = false;
+        let _applyTimer = null;
+        function safeApply() {
+            if (_applying) return;
+            _applying = true;
+            applyCanvasScale();
+            _applying = false;
+            clearTimeout(_applyTimer);
+            _applyTimer = setTimeout(function() {
+                _applying = true;
+                applyCanvasScale();
+                _applying = false;
+            }, 350);
+        }
+
+        window.addEventListener('resize', safeApply);
 
         // ================================================================
         // Touch coordinate mapping
+        //
+        // When rotated, Java's FreeJ2ME paints with TRANS_ROT270 and its
+        // pointer handler does a simple swap: gameX=e.y, gameY=e.x.
+        // TRANS_ROT270 maps game(gx,gy) → canvas(gy, gameW-1-gx), so the
+        // correct reverse is game(gameW-1-cy, cx).  Since Java only does
+        // (cy, cx) we need to pass (cx, gameW-1-cy) — i.e. flip the Y
+        // coordinate — so Java's swap produces the right result.
+        //
+        // "gameW" here is canvas.height (because setCanvasSize swaps w/h).
         // ================================================================
         function touchToCanvasCoords(touchX, touchY) {
             const rect = display.getBoundingClientRect();
             const scaleX = _canvasNativeW / rect.width;
             const scaleY = _canvasNativeH / rect.height;
-            return {
-                x: Math.floor((touchX - rect.left) * scaleX),
-                y: Math.floor((touchY - rect.top) * scaleY)
-            };
+            const cx = Math.floor((touchX - rect.left) * scaleX);
+            const cy = Math.floor((touchY - rect.top) * scaleY);
+
+            if (_isRotated) {
+                return { x: cx, y: _canvasNativeH - 1 - cy };
+            }
+            return { x: cx, y: cy };
         }
 
         // ================================================================
@@ -350,7 +386,7 @@
                         _canvasNativeH = height;
                         document.getElementById('loading').hidden = true;
                         display.style.display = 'block';
-                        applyCanvasScale();
+                        safeApply();
                         display.focus();
                     },
                     async Java_pl_zb3_freej2me_bridge_shell_Shell_waitForAndDispatchEvents(lib, listener) {
@@ -467,18 +503,22 @@
         // Public API
         // ================================================================
         // openJar(jarData, jarName, saveB64?, locale?, screenSize?, rotation?)
-        // saveB64:     base64 encoded ZIP of save data to restore before game starts.
-        //              Must be passed here (not called separately before openJar) because
-        //              CheerpJ rejects importData() while a previous FreeJ2ME.main() is running.
-        // locale:      BCP-47 locale string (e.g. 'zh-CN', 'en-US'). Sets microedition.locale
-        //              in systemproperties.conf before the game starts. If omitted, uses
-        //              navigator.language (device language), falling back to 'en-US'.
-        // screenSize:  "WxH" string (e.g. "240x320"). Passed to Java via LauncherUtil.saveApp()
-        //              so Config.init() reads correct canvas dimensions on startup.
-        //              If omitted, freej2me uses its own default (240x320).
-        // rotation:    boolean. If true, writes rotate=on to settings.conf. freej2me Java layer
-        //              handles rotation internally: TRANS_ROT270 painter + swapped setCanvasSize.
-        //              No CSS rotation needed on the JS side.
+        //
+        // Why 'app' mode instead of 'jar' mode:
+        //   FreeJ2ME.main() in 'jar' mode calls initApp(null,null,null), which
+        //   internally calls saveApp(null,null,null) — this REPLACES any pre-written
+        //   settings.conf with Config.DEFAULT_SETTINGS (240x320, rotate=off, etc.).
+        //   That's why screenSize/rotation parameters never took effect.
+        //
+        //   The desktop flow uses TWO pages: index.html (launcher) saves settings via
+        //   LauncherUtil.initApp(), then navigates to run.html which launches with
+        //   FreeJ2ME.main(['app', appId]) — 'app' mode reads the persisted settings
+        //   without overwriting them.
+        //
+        //   Our fix: mimic the desktop flow in a single page. We install the JAR as
+        //   a proper app via LauncherUtil.initApp() (which writes settings.conf with
+        //   our width/height/rotate values), then launch with 'app' mode.
+        //
         async function openJar(jarData, jarName, saveB64, locale, screenSize, rotation) {
             console.log('Start openJar!');
             if (!freej2meLib) {
@@ -486,12 +526,9 @@
             }
             console.log('freej2meLib init done');
             const array = (jarData instanceof Uint8Array) ? jarData : new Uint8Array(jarData);
-            cheerpOSAddStringFile('/str/game.jar', array);
-            // appId: 'game.jar' → 'game_jar' (dots replaced with underscores, matching LauncherUtil)
-            _currentAppId = 'game_jar';
-            _mediaPlayers = [];  // reset tracked players for new game
+            _mediaPlayers = [];
 
-            // Restore save data BEFORE starting the game, while no Java code is running.
+            // Restore save data BEFORE starting the game
             if (saveB64) {
                 try {
                     const binary = atob(saveB64);
@@ -505,65 +542,92 @@
                 }
             }
 
-            // Write screenSize and rotation to settings.conf BEFORE FreeJ2ME.main() starts.
-            //
-            // How the desktop flow works (index.html → run.html):
-            //   index.html calls LauncherUtil.saveApp() synchronously, persisting settings to IDB.
-            //   run.html is a SEPARATE page load — FreeJ2ME reads the persisted settings fresh.
-            //
-            // Our iOS flow (single page):
-            //   We call LauncherUtil.saveApp() here. FreeJ2ME.main() then calls initApp(null,null,null)
-            //   which internally calls saveApp(null,null,null) — reads the file we just wrote and
-            //   writes it back unchanged. Then config.init() reads it again for the final values.
-            //   This preserves our settings as long as the IDB write is flushed before initApp reads.
-            //
-            // To ensure correctness, we also pass the settings to initApp via a pending map that
-            // the Java FreeJ2ME constructor will pick up. Since we cannot hook into FreeJ2ME's
-            // constructor directly, we rely on pre-writing and the file surviving initApp's read-back.
-            if (screenSize || rotation !== undefined) {
-                try {
-                    const LauncherUtil = await freej2meLib.pl.zb3.freej2me.launcher.LauncherUtil;
-                    const HashMap = await freej2meLib.java.util.HashMap;
-                    const settingsMap = await new HashMap();
-
-                    if (screenSize) {
-                        const parts = String(screenSize).trim().split(/[x,]/);
-                        if (parts.length === 2) {
-                            const sw = parseInt(parts[0], 10), sh = parseInt(parts[1], 10);
-                            if (sw > 0 && sh > 0) {
-                                await settingsMap.put('width', String(sw));
-                                await settingsMap.put('height', String(sh));
-                                console.log('[freej2me] screenSize →', sw, 'x', sh);
-                            }
-                        }
-                    }
-                    await settingsMap.put('rotate', rotation ? 'on' : 'off');
-
-                    // saveApp writes to /files/game_jar/config/settings.conf via Java File API.
-                    // FreeJ2ME.main (jar mode) calls initApp(null,null,null) which reads this file
-                    // and writes it back — our values are preserved through that round-trip.
-                    await LauncherUtil.saveApp('game_jar', settingsMap, null, null);
-                    console.log('[freej2me] Settings pre-written: screenSize=', screenSize, 'rotation=', rotation);
-                } catch(e) {
-                    console.error('[freej2me] Failed to pre-write settings:', e);
-                }
-            }
-
-            // Set locale to inject on first waitForAndDispatchEvents call (after runJar starts,
-            // before MIDlet.startApp() reads microedition.locale).
-            // Priority: explicit locale arg → navigator.language → 'en-US'
+            // Set locale for injection on first waitForAndDispatchEvents call
             _pendingLocale = locale || navigator.language || 'en-US';
             _localeInjected = false;
             console.log('[freej2me] Pending locale =', _pendingLocale);
 
-            console.log('Start loading Jar, appId:', _currentAppId);
+            // ---- Install as a proper app (mimics index.html → launcher.js flow) ----
+            // This writes settings.conf ONCE with our values and never overwrites them.
+            const LauncherUtil = await freej2meLib.pl.zb3.freej2me.launcher.LauncherUtil;
+            const MIDletLoader = await freej2meLib.org.recompile.mobile.MIDletLoader;
+            const File = await freej2meLib.java.io.File;
+            const HashMap = await freej2meLib.java.util.HashMap;
+            const Config = await freej2meLib.org.recompile.freej2me.Config;
+
+            // Reset temp dir for clean state
+            await LauncherUtil.resetTmpDir();
+
+            // Write JAR to a temp file in CheerpJ's virtual filesystem
+            const jarFile = await new File('/files/_tmp/game.jar');
+            await LauncherUtil.copyJar(new Int8Array(array.buffer), jarFile);
+
+            // Create a MIDletLoader to extract appId, name, icon from the JAR manifest
+            const loader = await MIDletLoader.getMIDletLoader(jarFile);
+            let appId = await loader.getAppId();
+            if (!appId) {
+                // If no MIDlet-Name in MANIFEST.MF, derive appId from filename
+                const cleanName = (jarName || 'game.jar').replace(/\.jar$/i, '');
+                await LauncherUtil.ensureAppId(loader, cleanName);
+                appId = await loader.getAppId();
+            }
+            _currentAppId = appId;
+            console.log('[freej2me] appId =', appId);
+
+            // Build settings HashMap from Config.DEFAULT_SETTINGS + our overrides
+            const defaultSettings = {};
+            const ds = await Config.DEFAULT_SETTINGS;
+            const es = await ds.entrySet();
+            const esi = await es.iterator();
+            while (await esi.hasNext()) {
+                const entry = await esi.next();
+                defaultSettings[await entry.getKey()] = await entry.getValue();
+            }
+
+            // Apply screenSize override
+            if (screenSize) {
+                const parts = String(screenSize).trim().split(/[x,]/);
+                if (parts.length === 2) {
+                    const sw = parseInt(parts[0], 10), sh = parseInt(parts[1], 10);
+                    if (sw > 0 && sh > 0) {
+                        defaultSettings['width'] = String(sw);
+                        defaultSettings['height'] = String(sh);
+                        console.log('[freej2me] screenSize →', sw, 'x', sh);
+                    }
+                }
+            }
+
+            // Apply rotation override
+            if (rotation !== undefined && rotation !== null) {
+                defaultSettings['rotate'] = rotation ? 'on' : 'off';
+                console.log('[freej2me] rotation →', defaultSettings['rotate']);
+            }
+            _isRotated = (defaultSettings['rotate'] === 'on');
+
+            // Convert to Java HashMap
+            const settingsMap = await new HashMap();
+            for (const k of Object.keys(defaultSettings)) {
+                await settingsMap.put(k, defaultSettings[k]);
+            }
+
+            // Install the app: writes JAR, name, icon, settings.conf, etc.
+            // This is the same call that launcher.js makes when user clicks "Add game".
+            await LauncherUtil.initApp(jarFile, loader, settingsMap, null, null);
+            console.log('[freej2me] App installed with settings');
+
+            // Close the loader
+            try { await loader.close(); } catch(e) {}
+
+            // ---- Launch in 'app' mode (mimics run.html flow) ----
+            // 'app' mode reads the settings.conf we just wrote without overwriting it.
+            console.log('Start loading app, appId:', appId);
             const FreeJ2ME = await freej2meLib.org.recompile.freej2me.FreeJ2ME;
             console.log('FreeJ2ME loaded');
-            FreeJ2ME.main(['jar', '/str/game.jar']).catch(e => {
+            FreeJ2ME.main(['app', appId]).catch(e => {
                 console.error('FreeJ2ME error:', e);
                 document.getElementById('loading').textContent = '';
             });
-            // Begin polling for save data changes
+
             _startSaveWatch();
         }
 
@@ -744,7 +808,7 @@
         // ================================================================
         function setScaleMode(mode) {
             _scaleMode = (mode === 'fit') ? 'fit' : 'stretch';
-            applyCanvasScale();
+            safeApply();
         }
 
         function getScaleMode() {
@@ -767,7 +831,8 @@
             getScaleMode,
             setSpeed,
             getSaveData,
-            loadSaveData
+            loadSaveData,
+            safeApply: safeApply
         };
 
         // Input API matching J2meJS pattern for Swift pressButton calls
